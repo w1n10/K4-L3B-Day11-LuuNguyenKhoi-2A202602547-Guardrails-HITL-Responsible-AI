@@ -12,6 +12,7 @@ from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
 
 
@@ -37,28 +38,44 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
+    redacted = response or ""
 
-    # PII patterns to check
+    # Internal secrets — any hit means the whole reply must be withheld.
+    # Checked first so the PII patterns never split a secret into pieces.
+    SECRET_PATTERNS = {
+        "api_key": r"\bsk-[A-Za-z0-9-]{6,}",
+        "db_host": r"\b[\w.-]+\.internal(?::\d+)?\b",
+    }
+    for value in DEMO_SECRETS:
+        SECRET_PATTERNS.setdefault(f"known_secret:{value}", re.escape(value))
+
+    # Customer PII — redact in place, the rest of the answer is still useful.
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "vn_phone": r"(?<!\d)(?:\+84|0)\d{9,10}(?!\d)",
+        "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}",
+        "national_id": r"(?<!\d)(?:\d{12}|\d{9})(?!\d)",
+        "password": (
+            r"\b(?:password|passwd|pwd|m[aậ]t\s*kh[aẩ]u)\s*(?:is|:|=|l[aà])\s*"
+            r"(?!(?:never|not|required|reset|case|the|your|a|an)\b)[\"']?[^\s,.;\"']{3,}"
+        ),
     }
 
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
-        if matches:
-            issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+    secret_found = False
+    for group, patterns in (("secret", SECRET_PATTERNS), ("pii", PII_PATTERNS)):
+        for name, pattern in patterns.items():
+            matches = re.findall(pattern, redacted, re.IGNORECASE)
+            if matches:
+                label = "known_secret" if name.startswith("known_secret:") else name
+                issues.append(f"{label}: {len(matches)} found")
+                redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+                if group == "secret":
+                    secret_found = True
 
     return {
         "safe": len(issues) == 0,
         "issues": issues,
         "redacted": redacted,
+        "secret_found": secret_found,
     }
 
 
@@ -172,16 +189,34 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filtered = content_filter(response_text)
+        if filtered["secret_found"]:
+            # Fail closed: a partially redacted secret dump still reveals structure
+            self.blocked_count += 1
+            llm_response.content = self._text_content(
+                "I'm sorry, I cannot share internal system details. "
+                "Is there anything else I can help you with about your VinBank account?"
+            )
+            return llm_response
+        if not filtered["safe"]:
+            self.redacted_count += 1
+            llm_response.content = self._text_content(filtered["redacted"])
+            response_text = filtered["redacted"]
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                llm_response.content = self._text_content(
+                    "I'm sorry, I cannot provide that response. "
+                    "Please ask me about your VinBank banking needs."
+                )
+
+        return llm_response
+
+    @staticmethod
+    def _text_content(text: str) -> types.Content:
+        return types.Content(role="model", parts=[types.Part.from_text(text=text)])
 
 
 # ============================================================
